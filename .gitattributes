@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.sh     text eol=lf
+*.lua    text eol=lf
+*.htm    text eol=lf
+*.md     text eol=lf
+LICENSE  text eol=lf
+Makefile text eol=lf
+
+files/usr/bin/wakemypc    text eol=lf
+files/etc/init.d/wakemypc text eol=lf
+files/root/README.txt     text eol=lf
+
+*.png binary
+*.jpg binary

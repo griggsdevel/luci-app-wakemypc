@@ -1,0 +1,266 @@
+<!--
+WakeMyPc - LuCI control panel (plain HTML + JS, no template syntax)
+Placeholders replaced by luci/model/cbi/wakemypc.lua:
+  __CONTROL_URL__  __CSRF_TOKEN__  __BOT_RUN__  __PC_STATE__  __LANG__
+Copyright (c) 2026 WakeMyPc contributors - MIT
+-->
+<div class="cbi-section" id="wmp-panel">
+	<h3>WakeMyPc</h3>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><span class="wmp-lbl-bot">Bot</span></label>
+		<div class="cbi-value-field">
+			<span id="wmp-bot-state">…</span>
+			<span id="wmp-bot-extra" class="wmp-muted"></span>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><span class="wmp-lbl-pc">PC</span></label>
+		<div class="cbi-value-field">
+			<span id="wmp-pc-state">…</span>
+			<span id="wmp-pc-extra" class="wmp-muted"></span>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title">&nbsp;</label>
+		<div class="cbi-value-field">
+			<button type="button" class="cbi-button cbi-button-apply" onclick="wmpAction('start')">▶️ <span class="wmp-lbl-start">Start</span></button>
+			<button type="button" class="cbi-button cbi-button-reset" onclick="wmpAction('stop')">⏸ <span class="wmp-lbl-stop">Stop</span></button>
+			<button type="button" class="cbi-button cbi-button-action" onclick="wmpAction('restart')">🔄 <span class="wmp-lbl-restart">Restart</span></button>
+			<button type="button" class="cbi-button" onclick="wmpLogs()">📄 <span class="wmp-lbl-logs">Show logs</span></button>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title">&nbsp;</label>
+		<div class="cbi-value-field">
+			<span id="wmp-action-result" class="wmp-muted"></span>
+		</div>
+	</div>
+</div>
+
+<div id="wmp-modal" style="display:none;position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:9999">
+	<div style="background:#fff;color:#222;max-width:820px;margin:6% auto;padding:16px;border-radius:6px;box-shadow:0 4px 20px rgba(0,0,0,0.4)">
+		<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+			<strong>wakemypc — logread (tail 50)</strong>
+			<button type="button" class="cbi-button" onclick="wmpCloseLogs()">✕</button>
+		</div>
+		<pre id="wmp-logs" style="max-height:60vh;overflow:auto;background:#111;color:#9f9;padding:10px;border-radius:4px;font-size:12px;white-space:pre-wrap">…</pre>
+	</div>
+</div>
+
+<style>
+	.wmp-muted { color:#888; margin-left:8px; }
+	#wmp-scan-result table { border-collapse:collapse; margin-top:8px; }
+	#wmp-scan-result td, #wmp-scan-result th { border:1px solid #ccc; padding:3px 8px; font-size:12px; }
+</style>
+
+<script type="text/javascript">
+//<![CDATA[
+var WMP_URL = '__CONTROL_URL__';
+var WMP_TOKEN = '__CSRF_TOKEN__';
+var WMP_LANG = '__LANG__';
+
+var WMP_T = {
+	ru: {
+		on: '🟢 работает', off: '🔴 остановлен',
+		pc_on: '🟢 онлайн', pc_off: '🔴 офлайн', pc_unknown: '🟡 неизвестно',
+		bot_label: 'Бот', pc_label: 'ПК',
+		start: 'Запустить', stop: 'Остановить', restart: 'Перезапустить', logs: 'Показать логи',
+		done: 'Готово', error: 'Ошибка', none: 'устройства не найдены',
+		use: 'Выбрать', mac: 'MAC', ip: 'IP', state: 'Состояние',
+		wait: 'Подождите…', del_ok: 'Удалено. Обнови страницу.',
+		del_bad: 'Введи DELETE для подтверждения',
+		del_confirm: 'Полностью удалить WakeMyPc с роутера?',
+		applied: 'Подставлено, проверь поля выше и нажми «Сохранить»:'
+	},
+	en: {
+		on: '🟢 running', off: '🔴 stopped',
+		pc_on: '🟢 online', pc_off: '🔴 offline', pc_unknown: '🟡 unknown',
+		bot_label: 'Bot', pc_label: 'PC',
+		start: 'Start', stop: 'Stop', restart: 'Restart', logs: 'Show logs',
+		done: 'Done', error: 'Error', none: 'no devices found',
+		use: 'Use', mac: 'MAC', ip: 'IP', state: 'State',
+		wait: 'Please wait…', del_ok: 'Removed. Reload the page.',
+		del_bad: 'Type DELETE to confirm',
+		del_confirm: 'Remove WakeMyPc from this router completely?',
+		applied: 'Filled in, check the fields above and press Save:'
+	}
+};
+
+function wmpT(key) {
+	return (WMP_T[WMP_LANG] || WMP_T.en)[key] || key;
+}
+
+function wmpPost(action, extra, cb) {
+	var body = 'action=' + encodeURIComponent(action) + '&token=' + encodeURIComponent(WMP_TOKEN);
+	for (var k in (extra || {})) {
+		body += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(extra[k]);
+	}
+
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', WMP_URL, true);
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState !== 4) return;
+		var data = { ok: false, error: 'HTTP ' + xhr.status };
+		try { data = JSON.parse(xhr.responseText); } catch (e) {}
+		cb(data);
+	};
+	xhr.send(body);
+}
+
+function wmpSetText(id, text) {
+	var el = document.getElementById(id);
+	if (el) el.textContent = text;
+}
+
+// LuCI (ucode) wraps every CBI field: the wrapper div carries the plain id
+// ("cbid.wakemypc.pc.ip") while the real <input> inside it is named
+// "widget.cbid.wakemypc.pc.ip". Older LuCI keeps the input under the plain id.
+// Always return the actual form control, never the wrapper.
+function wmpField(name) {
+	var id = 'cbid.wakemypc.' + name;
+	var sel = 'input[id$="' + id + '"], select[id$="' + id + '"], textarea[id$="' + id + '"]';
+	var el = document.getElementById('widget.' + id)
+		|| document.querySelector(sel)
+		|| document.getElementById(id);
+
+	if (el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+		return el;
+	}
+
+	return document.querySelector(sel) || null;
+}
+
+function wmpRenderStatus(d) {
+	wmpSetText('wmp-bot-state', d.bot ? wmpT('on') : wmpT('off'));
+	if (d.pc === 'on') wmpSetText('wmp-pc-state', wmpT('pc_on'));
+	else if (d.pc === 'off') wmpSetText('wmp-pc-state', wmpT('pc_off'));
+	else wmpSetText('wmp-pc-state', wmpT('pc_unknown'));
+}
+
+function wmpRefresh() {
+	wmpPost('status', {}, function(d) {
+		if (d.ok) wmpRenderStatus(d);
+	});
+}
+
+function wmpAction(action) {
+	wmpSetText('wmp-action-result', wmpT('wait'));
+
+	wmpPost(action, {}, function(d) {
+		if (!d.ok) {
+			wmpSetText('wmp-action-result', wmpT('error') + ': ' + (d.error || ''));
+			return;
+		}
+
+		// The server answers only after the service really changed state.
+		wmpRenderStatus(d);
+		wmpSetText('wmp-action-result', wmpT('done'));
+
+		// One more check in case procd was still settling.
+		setTimeout(wmpRefresh, 2000);
+	});
+}
+
+function wmpLogs() {
+	var box = document.getElementById('wmp-modal');
+	var pre = document.getElementById('wmp-logs');
+	if (pre) pre.textContent = wmpT('wait');
+	if (box) box.style.display = 'block';
+	wmpPost('logs', {}, function(d) {
+		if (pre) pre.textContent = d.logs || (wmpT('error') + ': ' + (d.error || ''));
+	});
+}
+
+function wmpCloseLogs() {
+	var box = document.getElementById('wmp-modal');
+	if (box) box.style.display = 'none';
+}
+
+function wmpCheckToken() {
+	wmpSetText('wmp-token-result', wmpT('wait'));
+	wmpPost('checktoken', {}, function(d) {
+		if (d.ok) wmpSetText('wmp-token-result', '✅ ' + d.username);
+		else wmpSetText('wmp-token-result', '❌ ' + (d.error || ''));
+	});
+}
+
+function wmpUseDevice(ip, mac) {
+	var ipEl = wmpField('pc.ip');
+	var macEl = wmpField('pc.mac');
+
+	if (ipEl) ipEl.value = ip;
+	if (macEl) macEl.value = mac;
+
+	wmpSetText('wmp-scan-info', wmpT('applied') + ' ' + ip + ' / ' + mac);
+
+	// The MAC/IP fields are above the scan results, so bring them into view
+	// and flash them - otherwise it looks like nothing happened.
+	var target = ipEl || macEl;
+	if (target && target.scrollIntoView) {
+		target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+	}
+
+	[ipEl, macEl].forEach(function(el) {
+		if (!el) return;
+		var old = el.style.backgroundColor;
+		el.style.backgroundColor = '#d9f7be';
+		setTimeout(function() { el.style.backgroundColor = old; }, 1500);
+	});
+}
+
+function wmpScan() {
+	var box = document.getElementById('wmp-scan-result');
+	if (box) box.innerHTML = wmpT('wait');
+	wmpPost('scan', {}, function(d) {
+		if (!box) return;
+		if (!d.ok || !d.devices || d.devices.length === 0) {
+			box.textContent = wmpT('none');
+			return;
+		}
+		var html = '<table><tr><th>' + wmpT('ip') + '</th><th>' + wmpT('mac') + '</th><th>' + wmpT('state') + '</th><th></th></tr>';
+		for (var i = 0; i < d.devices.length; i++) {
+			var dev = d.devices[i];
+			html += '<tr><td>' + dev.ip + '</td><td>' + dev.mac + '</td><td>' + (dev.state || '') + '</td>' +
+				'<td><a href="#" onclick="wmpUseDevice(\'' + dev.ip + '\',\'' + dev.mac + '\');return false;">' + wmpT('use') + '</a></td></tr>';
+		}
+		html += '</table>';
+		box.innerHTML = html;
+	});
+}
+
+function wmpRemove() {
+	var el = document.getElementById('wmp-delete-confirm');
+	var val = el ? el.value : '';
+	if (val !== 'DELETE') { alert(wmpT('del_bad')); return; }
+	if (!confirm(wmpT('del_confirm'))) return;
+	wmpPost('remove', { confirm: val }, function(d) {
+		if (d.ok) {
+			wmpSetText('wmp-remove-result', wmpT('del_ok'));
+			alert((d.output || '') + '\n\n' + wmpT('del_ok'));
+		} else {
+			wmpSetText('wmp-remove-result', wmpT('error') + ': ' + (d.error || ''));
+		}
+	});
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+	var b = document.querySelector('.wmp-lbl-bot'); if (b) b.textContent = wmpT('bot_label');
+	var pc = document.querySelector('.wmp-lbl-pc'); if (pc) pc.textContent = wmpT('pc_label');
+	var s = document.querySelector('.wmp-lbl-start'); if (s) s.textContent = wmpT('start');
+	var p = document.querySelector('.wmp-lbl-stop'); if (p) p.textContent = wmpT('stop');
+	var r = document.querySelector('.wmp-lbl-restart'); if (r) r.textContent = wmpT('restart');
+	var l = document.querySelector('.wmp-lbl-logs'); if (l) l.textContent = wmpT('logs');
+
+	var bot = '__BOT_RUN__';
+	var pc = '__PC_STATE__';
+	wmpRenderStatus({ bot: bot === '1', pc: pc });
+
+	wmpRefresh();
+});
+//]]>
+</script>

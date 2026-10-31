@@ -1,0 +1,469 @@
+#!/bin/sh
+#
+# WakeMyPc - Telegram bot that powers a home PC on (Wake-on-LAN) and
+# shuts it down or reboots it over SSH.
+#
+# Busybox ash compatible. Tested on OpenWrt 21.02 - 25.x.
+#
+# Copyright (c) 2026 WakeMyPc contributors
+# License: MIT
+#
+
+BOT_VERSION="1.0.0"
+
+STATE_DIR="/tmp"
+OFFSET_FILE="$STATE_DIR/wakemypc.offset"
+OFFLINE_FILE="$STATE_DIR/wakemypc.offline_since"
+NAME_FILE="$STATE_DIR/wakemypc.botname"
+
+log() {
+	logger -t wakemypc "$*"
+}
+
+# ---------------------------------------------------------------------------
+# Configuration (UCI)
+# ---------------------------------------------------------------------------
+
+TOKEN=$(uci -q get wakemypc.bot.token)
+ALLOWED_ID=$(uci -q get wakemypc.bot.allowed_id)
+API_BASE=$(uci -q get wakemypc.bot.api_base)
+NOTIFY=$(uci -q get wakemypc.bot.notify)
+LANG_OPT=$(uci -q get wakemypc.bot.lang)
+
+[ -n "$API_BASE" ] || API_BASE="https://api.telegram.org"
+
+# Tolerate a trailing slash (reverse proxy / Cloudflare Worker URL).
+case "$API_BASE" in
+	*/) API_BASE="${API_BASE%/}" ;;
+esac
+
+PC_NAME=$(uci -q get wakemypc.pc.name)
+PC_IP=$(uci -q get wakemypc.pc.ip)
+PC_MAC=$(uci -q get wakemypc.pc.mac)
+LAN_IFACE=$(uci -q get wakemypc.pc.iface)
+SSH_USER=$(uci -q get wakemypc.pc.ssh_user)
+SSH_KEY=$(uci -q get wakemypc.pc.ssh_key)
+
+[ -n "$LAN_IFACE" ] || LAN_IFACE="br-lan"
+[ -n "$SSH_KEY" ] || SSH_KEY="/root/.ssh/id_ed25519"
+[ -n "$PC_NAME" ] || PC_NAME="PC"
+
+if [ -z "$TOKEN" ]; then
+	log "ERROR: token not configured (uci set wakemypc.bot.token=...)"
+	exit 1
+fi
+
+if [ -z "$ALLOWED_ID" ]; then
+	log "ERROR: allowed_id not configured (uci set wakemypc.bot.allowed_id=...)"
+	exit 1
+fi
+
+API="${API_BASE}/bot${TOKEN}"
+
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
+
+# ---------------------------------------------------------------------------
+# Language: "auto" follows the LuCI language, otherwise ru/en.
+# The same option drives the web UI and the bot messages.
+# ---------------------------------------------------------------------------
+
+case "$LANG_OPT" in
+	ru|en)
+		BOT_LANG="$LANG_OPT"
+		;;
+	*)
+		BOT_LANG=$(uci -q get luci.main.lang)
+		[ -n "$BOT_LANG" ] || BOT_LANG="en"
+		;;
+esac
+
+case "$BOT_LANG" in
+	ru*) BOT_LANG="ru" ;;
+	*)   BOT_LANG="en" ;;
+esac
+
+if [ "$BOT_LANG" = "ru" ]; then
+	M_STATUS_ON="🟢 ПК включён"
+	M_STATUS_OFF="🔴 ПК выключен"
+	M_STATUS_UNCLEAR="🟡 ПК отвечает нестабильно"
+	M_ALREADY_ON="🟢 ПК уже включён"
+	M_ALREADY_OFF="🔴 ПК уже выключен (нет SSH)"
+	M_NO_MAC="⚠️ MAC-адрес не задан. Открой LuCI → Services → WakeMyPc"
+	M_NO_IP="⚠️ IP-адрес ПК не задан. Открой LuCI → Services → WakeMyPc"
+	M_WOL_FAIL="❌ Не удалось отправить WOL-пакет через"
+	M_WOL_SENT="📡 Отправил WOL-пакет на"
+	M_WOL_WAIT="Жду включения (до 90 с)..."
+	M_WAKE_OK="🟢 ПК включился за"
+	M_WAKE_FAIL="🔴 ПК не ответил за 90с. Проверь WoL в BIOS (ErP off), Fast Startup и драйвер сетевой карты."
+	M_SHUTDOWN_SENT="🔌 Отправил команду выключения."
+	M_SHUTDOWN_TAIL="выключится через 5 секунд."
+	M_REBOOT_SENT="♻️ Отправил команду перезагрузки."
+	M_REBOOT_TAIL="перезагрузится через 5 секунд."
+	M_REBOOT_OFF="🔴 ПК выключен (нет SSH) — перезагружать нечего"
+	M_ONLINE_NOTIFY="🟢 ПК включился и готов к работе"
+	M_USE_BUTTONS="Используй кнопки внизу 👇"
+	M_GREETING_1="👋 Привет! Я"
+	M_GREETING_2="— управляю компьютером."
+	M_GREETING_3="Выбирай действие кнопками ниже 👇"
+	M_SECONDS="с"
+
+	BTN_STATUS="🟢 Статус"
+	BTN_WAKE="⏻ Включить ПК"
+	BTN_OFF="🔌 Выключить ПК"
+	BTN_REBOOT="♻️ Перезагрузить ПК"
+	KB_MAIN='{"keyboard":[[{"text":"🟢 Статус"}],[{"text":"⏻ Включить ПК"},{"text":"🔌 Выключить ПК"}],[{"text":"♻️ Перезагрузить ПК"}]],"resize_keyboard":true,"is_persistent":true}'
+else
+	M_STATUS_ON="🟢 PC is on"
+	M_STATUS_OFF="🔴 PC is off"
+	M_STATUS_UNCLEAR="🟡 PC answers unstable"
+	M_ALREADY_ON="🟢 PC is already on"
+	M_ALREADY_OFF="🔴 PC is already off (no SSH)"
+	M_NO_MAC="⚠️ MAC address is not set. Open LuCI → Services → WakeMyPc"
+	M_NO_IP="⚠️ PC IP address is not set. Open LuCI → Services → WakeMyPc"
+	M_WOL_FAIL="❌ Failed to send the WOL packet via"
+	M_WOL_SENT="📡 Magic packet sent to"
+	M_WOL_WAIT="Waiting for the PC (up to 90 s)..."
+	M_WAKE_OK="🟢 PC came up in"
+	M_WAKE_FAIL="🔴 No response in 90 s. Check WoL in BIOS (ErP off), Fast Startup and the NIC driver."
+	M_SHUTDOWN_SENT="🔌 Shutdown command sent."
+	M_SHUTDOWN_TAIL="will power off in 5 seconds."
+	M_REBOOT_SENT="♻️ Reboot command sent."
+	M_REBOOT_TAIL="will restart in 5 seconds."
+	M_REBOOT_OFF="🔴 PC is off (no SSH) — nothing to reboot"
+	M_ONLINE_NOTIFY="🟢 PC is up and ready"
+	M_USE_BUTTONS="Use the buttons below 👇"
+	M_GREETING_1="👋 Hi! I'm"
+	M_GREETING_2="— I control the computer."
+	M_GREETING_3="Use the buttons below 👇"
+	M_SECONDS="s"
+
+	BTN_STATUS="🟢 Status"
+	BTN_WAKE="⏻ Power on"
+	BTN_OFF="🔌 Shut down"
+	BTN_REBOOT="♻️ Reboot"
+	KB_MAIN='{"keyboard":[[{"text":"🟢 Status"}],[{"text":"⏻ Power on"},{"text":"🔌 Shut down"}],[{"text":"♻️ Reboot"}]],"resize_keyboard":true,"is_persistent":true}'
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# send <chat_id> <text> [reply_markup_json]
+send() {
+	_chat="$1"
+	_text="$2"
+	_kb="$3"
+
+	if [ -n "$_kb" ]; then
+		curl -s --max-time 30 -X POST "$API/sendMessage" \
+			--data-urlencode "chat_id=$_chat" \
+			--data-urlencode "text=$_text" \
+			--data-urlencode "reply_markup=$_kb" \
+			>/dev/null 2>&1
+	else
+		curl -s --max-time 30 -X POST "$API/sendMessage" \
+			--data-urlencode "chat_id=$_chat" \
+			--data-urlencode "text=$_text" \
+			>/dev/null 2>&1
+	fi
+}
+
+# Display name of the bot as created in @BotFather (cached in /tmp).
+bot_name() {
+	_name=$(cat "$NAME_FILE" 2>/dev/null)
+
+	if [ -z "$_name" ]; then
+		_name=$(curl -s --max-time 15 "${API}/getMe" 2>/dev/null | jq -r '.result.first_name // empty' 2>/dev/null)
+		if [ -n "$_name" ]; then
+			echo "$_name" > "$NAME_FILE"
+		fi
+	fi
+
+	[ -n "$_name" ] || _name="WakeMyPc"
+	echo "$_name"
+}
+
+# Single SSH probe. Returns 0 when the PC answers.
+pc_online() {
+	[ -n "$PC_IP" ] || return 1
+	[ -n "$SSH_USER" ] || return 1
+
+	# shellcheck disable=SC2086
+	ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${PC_IP}" "echo ok" >/dev/null 2>&1
+}
+
+# Three probes with a 3 s interval.
+# 0 = online (3/3), 1 = offline (0/3), 2 = uncertain (1-2 of 3)
+pc_online_strict() {
+	_ok=0
+	_i=0
+
+	while [ "$_i" -lt 3 ]; do
+		_i=$((_i + 1))
+		if pc_online; then
+			_ok=$((_ok + 1))
+		fi
+		if [ "$_i" -lt 3 ]; then
+			sleep 3
+		fi
+	done
+
+	[ "$_ok" -eq 3 ] && return 0
+	[ "$_ok" -eq 0 ] && return 1
+	return 2
+}
+
+is_number() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+send_status() {
+	_chat="$1"
+
+	if [ -z "$PC_IP" ]; then
+		send "$_chat" "$M_NO_IP"
+		return
+	fi
+
+	pc_online_strict
+	_rc=$?
+
+	if [ "$_rc" -eq 0 ]; then
+		send "$_chat" "$M_STATUS_ON ($PC_IP)" "$KB_MAIN"
+	elif [ "$_rc" -eq 1 ]; then
+		send "$_chat" "$M_STATUS_OFF" "$KB_MAIN"
+	else
+		send "$_chat" "$M_STATUS_UNCLEAR ($PC_IP)." "$KB_MAIN"
+	fi
+}
+
+do_wake() {
+	_chat="$1"
+
+	if [ -z "$PC_MAC" ]; then
+		send "$_chat" "$M_NO_MAC" "$KB_MAIN"
+		return
+	fi
+
+	if pc_online; then
+		send "$_chat" "$M_ALREADY_ON ($PC_IP)" "$KB_MAIN"
+		return
+	fi
+
+	etherwake -i "$LAN_IFACE" "$PC_MAC" >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		log "ERROR: etherwake failed (iface=$LAN_IFACE mac=$PC_MAC)"
+		send "$_chat" "$M_WOL_FAIL $LAN_IFACE." "$KB_MAIN"
+		return
+	fi
+
+	log "WOL packet sent to $PC_MAC via $LAN_IFACE"
+	send "$_chat" "$M_WOL_SENT $PC_MAC. $M_WOL_WAIT"
+
+	_elapsed=0
+	while [ "$_elapsed" -lt 90 ]; do
+		sleep 3
+		_elapsed=$((_elapsed + 3))
+
+		if pc_online; then
+			rm -f "$OFFLINE_FILE"
+			log "PC $PC_IP is online after ${_elapsed}s"
+			send "$_chat" "$M_WAKE_OK ${_elapsed}${M_SECONDS}" "$KB_MAIN"
+			return
+		fi
+	done
+
+	send "$_chat" "$M_WAKE_FAIL" "$KB_MAIN"
+}
+
+do_off() {
+	_chat="$1"
+
+	if ! pc_online; then
+		send "$_chat" "$M_ALREADY_OFF" "$KB_MAIN"
+		return
+	fi
+
+	# shellcheck disable=SC2086
+	ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${PC_IP}" "shutdown /s /t 5" >/dev/null 2>&1
+	log "Shutdown command sent to $PC_IP"
+	send "$_chat" "$M_SHUTDOWN_SENT $PC_NAME $M_SHUTDOWN_TAIL" "$KB_MAIN"
+}
+
+do_reboot() {
+	_chat="$1"
+
+	if ! pc_online; then
+		send "$_chat" "$M_REBOOT_OFF" "$KB_MAIN"
+		return
+	fi
+
+	# shellcheck disable=SC2086
+	ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${PC_IP}" "shutdown /r /t 5" >/dev/null 2>&1
+	log "Reboot command sent to $PC_IP"
+	send "$_chat" "$M_REBOOT_SENT $PC_NAME $M_REBOOT_TAIL" "$KB_MAIN"
+}
+
+# ---------------------------------------------------------------------------
+# Online/offline watcher (optional, "notify" option, off by default)
+# ---------------------------------------------------------------------------
+
+check_transition() {
+	_now=$(date +%s)
+
+	pc_online_strict
+	_rc=$?
+
+	case "$_rc" in
+		0)
+			if [ -f "$OFFLINE_FILE" ]; then
+				_since=$(cat "$OFFLINE_FILE" 2>/dev/null)
+				is_number "$_since" || _since=0
+				[ "$_since" -gt 0 ] || _since="$_now"
+
+				_down=$((_now - _since))
+
+				if [ "$_down" -ge 120 ] && [ "$NOTIFY" = "1" ]; then
+					log "PC online again after ${_down}s offline, notifying"
+					send "$ALLOWED_ID" "$M_ONLINE_NOTIFY"
+				else
+					log "PC online again after ${_down}s offline (notifications off)"
+				fi
+
+				rm -f "$OFFLINE_FILE"
+			fi
+			;;
+		1)
+			if [ -f "$OFFLINE_FILE" ]; then
+				_since=$(cat "$OFFLINE_FILE" 2>/dev/null)
+				is_number "$_since" || echo "$_now" > "$OFFLINE_FILE"
+			else
+				echo "$_now" > "$OFFLINE_FILE"
+				log "PC went offline, timestamp saved"
+			fi
+			;;
+		*)
+			# 1-2 of 3 probes failed: uncertain state, keep the previous one.
+			log "PC state uncertain (partial SSH failures), keeping previous state"
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# Telegram updates
+# ---------------------------------------------------------------------------
+
+handle_message() {
+	_update="$1"
+
+	_chat=$(echo "$_update" | jq -r '.message.chat.id // empty' 2>/dev/null)
+	_text=$(echo "$_update" | jq -r '.message.text // empty' 2>/dev/null)
+
+	[ -n "$_chat" ] || return 0
+
+	if [ "$_chat" != "$ALLOWED_ID" ]; then
+		log "Ignoring message from unauthorized chat $_chat"
+		return 0
+	fi
+
+	case "$_text" in
+		/start*)
+			# Refresh the cached name so a rename in @BotFather shows up
+			# on the next /start without touching the router.
+			rm -f "$NAME_FILE"
+			_bot=$(bot_name)
+			send "$_chat" "$M_GREETING_1 $_bot $M_GREETING_2
+
+$M_GREETING_3" "$KB_MAIN"
+			;;
+		/status*|"$BTN_STATUS"|"🟢 Статус"|"🟢 Status")
+			send_status "$_chat"
+			;;
+		/wake*|"$BTN_WAKE"|"⏻ Включить ПК"|"⏻ Power on")
+			do_wake "$_chat"
+			;;
+		/off*|"$BTN_OFF"|"🔌 Выключить ПК"|"🔌 Shut down")
+			do_off "$_chat"
+			;;
+		/reboot*|"$BTN_REBOOT"|"♻️ Перезагрузить ПК"|"♻️ Reboot")
+			do_reboot "$_chat"
+			;;
+		*)
+			send "$_chat" "$M_USE_BUTTONS" "$KB_MAIN"
+			;;
+	esac
+}
+
+get_updates() {
+	_offset="$1"
+
+	# shellcheck disable=SC2086
+	curl -s --max-time 40 "${API}/getUpdates?offset=${_offset}&timeout=25"
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+main() {
+	log "Starting WakeMyPc v${BOT_VERSION} (lang=${BOT_LANG}, api_base=${API_BASE}, pc=${PC_IP:-unset})"
+
+	_offset=$(cat "$OFFSET_FILE" 2>/dev/null)
+	is_number "$_offset" || _offset=0
+
+	_last_check=$(date +%s)
+
+	while :; do
+		_response=$(get_updates "$_offset")
+
+		if [ -n "$_response" ]; then
+			_count=$(echo "$_response" | jq -r '.result | length' 2>/dev/null)
+			is_number "$_count" || _count=0
+
+			if [ "$_count" -eq 0 ] && echo "$_response" | jq -e '.ok == false' >/dev/null 2>&1; then
+				_err=$(echo "$_response" | jq -r '.description // "unknown error"' 2>/dev/null)
+				log "ERROR from Telegram API: $_err"
+				sleep 10
+			fi
+
+			_i=0
+			while [ "$_i" -lt "$_count" ]; do
+				_update=$(echo "$_response" | jq -c ".result[$_i]" 2>/dev/null)
+				_uid=$(echo "$_update" | jq -r '.update_id // empty' 2>/dev/null)
+
+				if [ -n "$_update" ]; then
+					handle_message "$_update"
+				fi
+
+				if is_number "$_uid"; then
+					_offset=$((_uid + 1))
+					echo "$_offset" > "$OFFSET_FILE"
+				fi
+
+				_i=$((_i + 1))
+			done
+		else
+			log "No response from Telegram API, retrying"
+			sleep 10
+		fi
+
+		_now=$(date +%s)
+		if [ $((_now - _last_check)) -ge 60 ]; then
+			check_transition
+			_last_check=$(date +%s)
+		fi
+
+		sleep 1
+	done
+}
+
+trap 'log "Stopping WakeMyPc"; exit 0' TERM INT
+
+main
