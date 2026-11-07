@@ -100,6 +100,11 @@ if [ "$BOT_LANG" = "ru" ]; then
 	M_REBOOT_SENT="♻️ Отправил команду перезагрузки."
 	M_REBOOT_TAIL="перезагрузится через 5 секунд."
 	M_REBOOT_OFF="🔴 ПК выключен (нет SSH) — перезагружать нечего"
+	M_SHUTDOWN_DONE="🔴 ПК выключился"
+	M_SHUTDOWN_FAIL="🟡 ПК не выключился за 60 с — проверь журнал Windows"
+	M_REBOOT_DONE="🟢 ПК перезагрузился за"
+	M_REBOOT_NODOWN="🟡 ПК не выключился за 90 с — перезагрузка не подтверждена"
+	M_REBOOT_NOUP="🟡 ПК выключился, но не поднялся за 180 с"
 	M_ONLINE_NOTIFY="🟢 ПК включился и готов к работе"
 	M_USE_BUTTONS="Используй кнопки внизу 👇"
 	M_GREETING_1="👋 Привет! Я"
@@ -130,6 +135,11 @@ else
 	M_REBOOT_SENT="♻️ Reboot command sent."
 	M_REBOOT_TAIL="will restart in 5 seconds."
 	M_REBOOT_OFF="🔴 PC is off (no SSH) — nothing to reboot"
+	M_SHUTDOWN_DONE="🔴 PC is off"
+	M_SHUTDOWN_FAIL="🟡 PC did not shut down within 60 s — check the Windows log"
+	M_REBOOT_DONE="🟢 PC rebooted in"
+	M_REBOOT_NODOWN="🟡 PC did not go down within 90 s — reboot not confirmed"
+	M_REBOOT_NOUP="🟡 PC went down but did not come back within 180 s"
 	M_ONLINE_NOTIFY="🟢 PC is up and ready"
 	M_USE_BUTTONS="Use the buttons below 👇"
 	M_GREETING_1="👋 Hi! I'm"
@@ -295,6 +305,9 @@ do_off() {
 	ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${PC_IP}" "shutdown /s /t 5" >/dev/null 2>&1
 	log "Shutdown command sent to $PC_IP"
 	send "$_chat" "$M_SHUTDOWN_SENT $PC_NAME $M_SHUTDOWN_TAIL" "$KB_MAIN"
+
+	# Confirm in the background: the PC needs ~10-30 s to actually stop.
+	confirm_off "$_chat" &
 }
 
 do_reboot() {
@@ -309,6 +322,76 @@ do_reboot() {
 	ssh $SSH_OPTS -i "$SSH_KEY" "${SSH_USER}@${PC_IP}" "shutdown /r /t 5" >/dev/null 2>&1
 	log "Reboot command sent to $PC_IP"
 	send "$_chat" "$M_REBOOT_SENT $PC_NAME $M_REBOOT_TAIL" "$KB_MAIN"
+
+	# Confirm in the background: wait for the PC to go down, then to come back.
+	confirm_reboot "$_chat" &
+}
+
+# ---------------------------------------------------------------------------
+# Confirmation after shutdown / reboot
+#
+# Both run in a background subshell: the main loop keeps answering commands
+# while the PC goes down (and comes back).
+# ---------------------------------------------------------------------------
+
+confirm_off() {
+	_chat="$1"
+	_elapsed=0
+
+	while [ "$_elapsed" -lt 60 ]; do
+		sleep 3
+		_elapsed=$((_elapsed + 3))
+
+		if ! pc_online; then
+			rm -f "$OFFLINE_FILE"
+			log "PC $PC_IP is off after ${_elapsed}s (shutdown confirmed)"
+			send "$_chat" "$M_SHUTDOWN_DONE ($PC_NAME)" "$KB_MAIN"
+			return
+		fi
+	done
+
+	log "PC $PC_IP still answers ${_elapsed}s after the shutdown command"
+	send "$_chat" "$M_SHUTDOWN_FAIL" "$KB_MAIN"
+}
+
+confirm_reboot() {
+	_chat="$1"
+	_elapsed=0
+	_down=0
+
+	# 1. the PC must stop answering
+	while [ "$_elapsed" -lt 90 ]; do
+		sleep 3
+		_elapsed=$((_elapsed + 3))
+
+		if ! pc_online; then
+			_down=1
+			break
+		fi
+	done
+
+	if [ "$_down" -ne 1 ]; then
+		log "PC $PC_IP never went down after the reboot command"
+		send "$_chat" "$M_REBOOT_NODOWN" "$KB_MAIN"
+		return
+	fi
+
+	log "PC $PC_IP went down after ${_elapsed}s, waiting for it to come back"
+
+	# 2. and answer again
+	while [ "$_elapsed" -lt 270 ]; do
+		sleep 3
+		_elapsed=$((_elapsed + 3))
+
+		if pc_online; then
+			rm -f "$OFFLINE_FILE"
+			log "PC $PC_IP is back after ${_elapsed}s (reboot confirmed)"
+			send "$_chat" "$M_REBOOT_DONE ${_elapsed}${M_SECONDS} ($PC_NAME)" "$KB_MAIN"
+			return
+		fi
+	done
+
+	send "$_chat" "$M_REBOOT_NOUP" "$KB_MAIN"
 }
 
 # ---------------------------------------------------------------------------
