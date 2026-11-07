@@ -112,6 +112,7 @@ Uninstall is also in LuCI → **Danger zone** (type `DELETE`).
 MIT © 2026 WakeMyPc contributors
 
 ---
+[🇬🇧 English](#english) | [🇷🇺 Русский](#русский)
 
 <a name="русский"></a>
 ## Русский
