@@ -121,7 +121,7 @@ function Invoke-RouterSsh {
 
     try { $out = @(& ssh @sshArgs 2>&1) } catch { $out = @("$($_.Exception.Message)") }
 
-    if (($out -join "`n") -match 'HOST IDENTIFICATION HAS CHANGED|Host key verification failed') {
+    if (($out -join "`n") -match 'HOST IDENTIFICATION|HOST KEY|Host key verification failed|REMOTE HOST|@@@@@@') {
         Warn "known_hosts holds an old key for $RouterHost - refreshing"
         & ssh-keygen -R $RouterHost 2>&1 | Out-Null
         try { $out = @(& ssh @sshArgs 2>&1) } catch { $out = @("$($_.Exception.Message)") }

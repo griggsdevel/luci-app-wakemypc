@@ -184,7 +184,7 @@ function Invoke-RouterSsh {
     # A router that was reflashed has a new host key, while known_hosts still
     # holds the old one -> "Host key verification failed" and no output at all.
     # Drop the stale entry and retry once.
-    if (($out -join "`n") -match 'HOST IDENTIFICATION HAS CHANGED|Host key verification failed') {
+    if (($out -join "`n") -match 'HOST IDENTIFICATION|HOST KEY|Host key verification failed|REMOTE HOST|@@@@@@') {
         Warn "known_hosts holds an old key for $RouterHost (router was reflashed?) - refreshing it"
         & ssh-keygen -R $RouterHost 2>&1 | Out-Null
         & ssh-keygen -R "[$RouterHost]:$Port" 2>&1 | Out-Null
